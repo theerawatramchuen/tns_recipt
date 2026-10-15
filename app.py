@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """RUETHAI KASIKRANUN RECEIPT SYSTEM  -  pip install flask ; python app.py ; open http://127.0.0.1:5000
-Needs create_receipt_tables.py + escp_thai_print.py + receipts.db in the same folder."""
-import os, re, sqlite3, subprocess, unicodedata
+Prints through the normal Windows printer driver (browser Print). Needs create_receipt_tables.py + receipts.db."""
+import os, re, sqlite3, unicodedata
 from decimal import Decimal, ROUND_HALF_UP
 from flask import Flask, request, redirect, render_template_string, flash, g, jsonify, Response
 from jinja2 import DictLoader
+from markupsafe import Markup, escape
 from create_receipt_tables import SCHEMA, baht_text
-import escp_thai_print as E
 
 TITLE = "RUETHAI KASIKRANUN RECEIPT SYSTEM"
 DB = os.environ.get("RECEIPT_DB", "receipts.db")
-PRINTER = os.environ.get("LQ590_PRINTER", "EPSON LQ-590")
-E.THAI_TABLE = int(os.environ.get("THAI_TABLE", "1"))   # ESC t n  (see LQ-590 manual)
-COLS = int(os.environ.get("PRINT_COLS", "110"))          # characters per line (condensed)
+PRINT_FONT = os.environ.get("PRINT_FONT", "Tahoma")        # any Thai-capable font installed in Windows
+PRINT_PT = os.environ.get("PRINT_FONT_PT", "9")          # font size on paper; lower it if the form is wider than the paper
+PRINT_BOLD = os.environ.get("PRINT_FONT_WEIGHT", "normal")  # "bold" strikes harder on multi-part paper; "normal" for plain
+PRINT_LINE_PT = os.environ.get("PRINT_LINE_PT", "13")     # row pitch in pt - fixed, so a larger font does not move the rows
 FORM = os.environ.get("RECEIPT_FORM", "receipt_form.txt")   # editable print layout (plain text)
 TABLES = {"customer": "Customers", "goods": "Goods", "discount": "Discounts"}
 
@@ -132,17 +133,27 @@ def dw(s): return sum(0 if unicodedata.category(ch) == "Mn" else 1 for ch in s) 
 def pad(s, w, a="l"):
     s = str(s); k = max(w - dw(s), 0)
     return s + " " * k if a == "l" else " " * k + s if a == "r" else " " * (k // 2) + s + " " * (k - k // 2)
-def clip(s, w):
-    o, n = "", 0
-    for ch in str(s):
-        k = 0 if unicodedata.category(ch) == "Mn" else 1
-        if n + k > w: break
-        o += ch; n += k
-    return o
 def m(x): return f"{float(x):,.2f}"
 TOK = re.compile(r"\{([<>^]?)([a-z_]+) *\}")     # {name   } = field as wide as the token; {>name} right, {^name} centre
-def fill(line, v):
-    return TOK.sub(lambda t: pad(clip(v.get(t[2], ""), len(t[0])), len(t[0]), {"": "l", "<": "l", ">": "r", "^": "c"}[t[1]]), line)
+ALIGN = {"": "left", "<": "left", ">": "right", "^": "center"}
+
+def line_html(ln, v, W):
+    """One template line -> absolutely positioned boxes, so columns stay aligned with proportional Thai fonts."""
+    segs, col, last = [], 0, 0
+    def static(txt, c0):
+        for s in re.finditer(r"\S+(?: \S+)*", txt):
+            rule = len(s[0]) > 3 and re.fullmatch(r"([-=_.*])\1*", s[0])     # ruled line: fill exactly its width
+            segs.append((c0 + dw(txt[:s.start()]), len(s[0]) if rule else None, "left", s[0] * 2 if rule else s[0]))
+    for t in TOK.finditer(ln):
+        pre = ln[last:t.start()]; static(pre, col); col += dw(pre)
+        segs.append((col, len(t[0]), ALIGN[t[1]], str(v.get(t[2], "")))); col += len(t[0]); last = t.end()
+    static(ln[last:], col)
+    if len(segs) == 1 and segs[0][1] is None and segs[0][0] > 0:       # text centred with spaces -> centre on the page
+        lead, trail = segs[0][0], W - segs[0][0] - dw(segs[0][3])
+        if abs(lead - trail) <= 2: segs = [(0, W, "center", segs[0][3])]
+    h = "".join(f'<span style="left:{c}ch;' + (f'width:{w}ch;text-align:{a}"' if w else '"') + f'>{escape(t)}</span>'
+                for c, w, a, t in segs)
+    return f'<div class="l">{h}</div>'
 
 def default_form(W=110):
     tk = lambda n, w, a="": "{" + (a + n).ljust(w - 2) + "}"
@@ -156,6 +167,8 @@ def default_form(W=110):
          "##   cust_branch_b cust_other_a cust_other_b subtotal discount_total total total_text",
          "## Lines between #ITEMS and #END repeat for every item: no name qty price amount discount net",
          "## (discount prints the discount method only, e.g. 10% , 2%). Anything else is printed as typed.",
+         "## #ITEMS 10 = item area is always 10 items tall, so the lines below it stay on a FIXED row (extra items are not printed).",
+         "## #ROW 40 = the next line is printed on row 40 of the page (blank rows are added before it).",
          pad("ใบส่งของ / ใบเสร็จรับเงิน", W, "c"), pad("DELIVERY ORDER / RECEIPT", W, "c"),
          pad("เลขที่ใบสั่งสินค้า", 28) + pad("ฤทัย กสิกรานันท์", W - 50, "c") + "เลขที่ " + tk("receipt_no", 15, ">"),
          tk("order_no", 28) + pad("RUETHAI KASIKRANUN", W - 50, "c") + "วันที่ " + tk("date", 15, ">"),
@@ -166,7 +179,7 @@ def default_form(W=110):
     for a, b in zip(["cust_name", "cust_addr_a", "cust_addr_b", "cust_addr_c"],
                     ["cust_branch_a", "cust_branch_b", "cust_other_a", "cust_other_b"]):
         o.append("   " + tk(a, h - 3) + tk(b, W - h))
-    o += ["", "".join(pad(t, n, "l" if k < 2 else "r") for k, (t, n) in enumerate(zip(hd, w))), "-" * W, "#ITEMS",
+    o += ["", "".join(pad(t, n, "l" if k < 2 else "r") for k, (t, n) in enumerate(zip(hd, w))), "-" * W, "#ITEMS 10",
           "".join(tk(n, x, a) for n, x, a in zip(names, w, al)), "#END", "-" * W,
           tk("total_text", W - 14) + tk("total", 14, ">")]
     return "\n".join(o) + "\n"
@@ -176,7 +189,7 @@ def load_form():
         open(FORM, "w", encoding="utf-8").write(default_form())
     return open(FORM, encoding="utf-8-sig").read().splitlines()
 
-def receipt_text(i):
+def receipt_html(i):
     c = db(); r = c.execute("SELECT * FROM receipt WHERE id=?", (i,)).fetchone()
     cu = c.execute("SELECT * FROM customer WHERE id=?", (r["customer_id"],)).fetchone()
     ls = c.execute("SELECT * FROM receipt_detail WHERE receipt_id=? ORDER BY line_no", (i,)).fetchall()
@@ -188,15 +201,24 @@ def receipt_text(i):
     rows = [{"no": l["line_no"], "name": l["goods_name"], "qty": f"{l['quantity']:g} {l['unit']}",
              "price": m(l["unit_price"]), "amount": m(l["amount"]), "discount": l["discount_method"],
              "net": m(l["net_amount"])} for l in ls]
-    out, blk, mode = [], [], 0
-    for ln in load_form():
-        if ln.startswith("##"): continue
-        if ln.strip() == "#ITEMS": mode, blk = 1, []
-        elif ln.strip() == "#END":
-            out += [fill(b, rw) for rw in rows for b in blk]; mode = 0
+    tpl = [l for l in load_form() if not l.startswith("##")]
+    W = max([dw(l) for l in tpl if not l.strip().startswith("#")] + [1])
+    out, blk, mode, cap, warn = [], [], 0, None, ""
+    blank = '<div class="l"></div>'
+    for ln in tpl:
+        s = ln.strip().split()
+        if s and s[0] == "#ITEMS":
+            mode, blk, cap = 1, [], (int(s[1]) if len(s) > 1 else None)
+        elif s and s[0] == "#END":
+            use = rows[:cap] if cap else rows
+            if cap and len(rows) > cap: warn = f"This receipt has {len(rows)} items but the form prints only {cap} (#ITEMS {cap} in receipt_form.txt)."
+            body = [line_html(b, rw, W) for rw in use for b in blk]
+            out += body + [blank] * ((cap or 0) * len(blk) - len(body)); mode = 0
+        elif s and s[0] == "#ROW":
+            out += [blank] * (int(s[1]) - 1 - len(out))          # jump so the next line is on this row
         elif mode: blk.append(ln)
-        else: out.append(fill(ln, v).rstrip())
-    return "\n".join(out) + "\n"
+        else: out.append(line_html(ln, v, W))
+    return W, Markup("".join(out)), warn
 
 @app.route("/form/blank")
 def form_blank():
@@ -204,21 +226,15 @@ def form_blank():
     return Response(open(FORM, "rb").read(), mimetype="text/plain",
                     headers={"Content-Disposition": "attachment; filename=receipt_form.txt"})
 
-@app.route("/receipt/<int:i>/print", methods=["GET", "POST"])
+@app.route("/receipt/<int:i>/print")
 def receipt_print(i):
-    if request.method == "POST":
-        text = request.form["text"]
-        data = E.INIT + E.NLQ_ON + E.select_thai() + E.CONDENSED_ON + \
-               E.thai(text.replace("\r\n", "\n").replace("\n", "\r\n")) + E.FORMFEED
-        if request.form["action"] == "prn":
-            return Response(data, mimetype="application/octet-stream",
-                            headers={"Content-Disposition": f"attachment; filename=receipt_{i}.prn"})
-        try:
-            if os.name == "nt": E.send_raw(data, PRINTER)
-            else: subprocess.run(["lp", "-d", PRINTER, "-o", "raw"], input=data, check=True)
-            flash("Sent to " + PRINTER)
-        except Exception as e: flash(f"Print failed: {e}", "err")
-    return render_template_string(T_PRINT, i=i, text=receipt_text(i), printer=PRINTER)
+    W, body, warn = receipt_html(i)
+    if warn: flash(warn, "err")
+    pt = request.args.get("pt", PRINT_PT)                     # /print?pt=9.5&bold=0 overrides without restarting
+    wt = "bold" if request.args.get("bold", "1" if PRINT_BOLD == "bold" else "0") == "1" else "normal"
+    try: float(pt)
+    except ValueError: pt = PRINT_PT
+    return render_template_string(T_PRINT, i=i, W=W, body=body, font=PRINT_FONT, pt=pt, wt=wt, lh=PRINT_LINE_PT)
 
 # ---------- templates ----------
 app.jinja_loader = DictLoader({"base": """<!doctype html><html lang="th"><meta charset="utf-8">
@@ -313,13 +329,15 @@ const j=await r.json();if(!r.ok){const e=$('#err');e.textContent=j.error;e.hidde
 </script>{% endblock %}"""
 
 T_PRINT = "{% extends 'base' %}{% set nav='r' %}{% block body %}" + """
-<style>#pv{display:none}@media print{header,main{display:none}#pv{display:block;white-space:pre;font:8pt/1.25 "Courier New",monospace;margin:0}}</style>
-<h1>Print receipt</h1><p style="color:var(--mut)">Edit the text below if needed. The layout comes from <b>receipt_form.txt</b>; change it in any text editor and reload this page. The preview font is approximate.</p>
-<form method="post"><textarea id="tx" name="text" rows="22" wrap="off" style="width:100%;font:13px/1.3 'Courier New','Noto Sans Mono',monospace">{{text}}</textarea>
-<div class="bar" style="margin-top:.8rem"><button name="action" value="send">Send to {{printer}}</button>
-<button name="action" value="prn" class="b2">Download .prn</button>
-<button type="button" class="b2" onclick="pv.textContent=tx.value;window.print()">Browser print</button>
-<a class="btn b2" href="/form/blank">Blank form (.txt)</a><a class="btn b2" href="/receipt/{{i}}">Edit receipt</a><a class="btn b2" href="/receipts">Back</a></div></form><pre id="pv"></pre>{% endblock %}"""
+<style>#sheet{background:#fff;color:#000;box-sizing:content-box;width:{{W}}ch;margin:0 auto;padding:8mm;border:1px solid var(--line);
+font:{{wt}} {{pt}}pt/{{lh}}pt {{font}},"Leelawadee UI","Noto Sans Thai",sans-serif;overflow-x:auto}
+.l{position:relative;height:{{lh}}pt;white-space:pre}.l span{position:absolute;top:0;white-space:pre;overflow:hidden}
+@media print{header,.noprint,.msg{display:none}main{padding:0;max-width:none}body{background:#fff}#sheet{border:0;padding:0;margin:0}@page{margin:6mm}}</style>
+<div class="noprint"><h1>Print receipt</h1><p style="color:var(--mut)">Click on the form to fix any text before printing. Layout comes from <b>receipt_form.txt</b>. In the print dialog choose your LQ-590 printer.</p>
+<div class="bar"><button onclick="window.print()">Print</button><a class="btn b2" href="/receipt/{{i}}">Edit receipt</a>
+<form class="i" method="get" style="display:inline-flex;gap:.4rem;align-items:center">Font pt <input name="pt" value="{{pt}}" size="3"> <label><input type="checkbox" name="bold" value="1" {{'checked' if wt=='bold'}}> Bold</label><input type="hidden" name="bold" value="0"><button class="b2">Apply</button></form>
+<a class="btn b2" href="/form/blank">Blank form (.txt)</a><a class="btn b2" href="/receipts">Back</a></div></div>
+<div id="sheet" contenteditable="true" spellcheck="false">{{ body }}</div>{% endblock %}"""
 
 with sqlite3.connect(DB) as _c:
     _c.executescript(SCHEMA)

@@ -4,24 +4,25 @@
 ##   cust_branch_b cust_other_a cust_other_b subtotal discount_total total total_text
 ## Lines between #ITEMS and #END repeat for every item: no name qty price amount discount net
 ## (discount prints the discount method only, e.g. 10% , 2%). Anything else is printed as typed.
-                                            ใบส่งของ / ใบเสร็จรับเงิน                                             
-                                           DELIVERY ORDER / RECEIPT                                           
-เลขที่ใบสั่งสินค้า                                        ฤทัย กสิกรานันท์                        เลขที่ {>receipt_no  }
-{order_no                  }                     RUETHAI KASIKRANUN                     วันที่ {>date        }
-                      511/364 ซอย 37 ถ.จรัญสนิทวงศ์ แขวงบางขุนศรี เขตบางกอกน้อย กรุงเทพฯ 10700                       
-                       โทร 02-4121787 โทรสาร 02-4120186 เลขประจำตัวผู้เสียภาษี 3102001314527                       
-                 ผู้จำหน่าย ข้าวหอมมะลิแปดริ้วแท้ ข้าวซ้อมมือ ข้าวหอมผสมมันปู ข้าวมันปูอนามัย และข้าวเหนียวอย่างดี                  
+## '#ROW 37' = the next line prints on row 37 of the form, so the total never moves. Rows count from the first non-## line.
+                                                                            
 
-นามผู้ซื้อ                                                     สถานที่ส่ง
-   {cust_name                                             }{cust_branch_a                                    }
-   {cust_addr_a                                           }{cust_branch_b                                    }
-   {cust_addr_b                                           }{cust_other_a                                     }
-   {cust_addr_c                                           }{cust_other_b                                     }
+                                       
+                                                                                                                 {^receipt_no  }
 
-ลำดับ รายการ                                            จำนวนสั่ง     หน่วยละ     จำนวนเงิน      ส่วนลด     จำนวนเงิน
---------------------------------------------------------------------------------------------------------------
+     {order_no                  }                                                                                {^date        }
+                 
+                   
+ 
+     {cust_name                                             }        {cust_branch_a                                    }
+     {cust_addr_a                                           }        {cust_branch_b                                    }
+     {cust_addr_b                                           }        {cust_other_a                                     }
+     {cust_addr_c                                           }        {cust_other_b                                     }
+
+
+
 #ITEMS
-{no }{name                                     }{>qty        }{>price   }{>amount    }{>discount}{>net       }
+     {no }    {name                      }{>qty        }  {>price   }{>amount    }      {^discount           }{>net       }
 #END
---------------------------------------------------------------------------------------------------------------
-{total_text                                                                                    }{>total      }
+#ROW 37
+     {^total_text                                                                                    }        {>total      }
