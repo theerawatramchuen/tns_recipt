@@ -14,6 +14,7 @@ PRINT_FONT = os.environ.get("PRINT_FONT", "Tahoma")        # any Thai-capable fo
 PRINT_PT = os.environ.get("PRINT_FONT_PT", "9")          # font size on paper; lower it if the form is wider than the paper
 PRINT_BOLD = os.environ.get("PRINT_FONT_WEIGHT", "normal")  # "bold" strikes harder on multi-part paper; "normal" for plain
 PRINT_LINE_PT = os.environ.get("PRINT_LINE_PT", "13")     # row pitch in pt - fixed, so a larger font does not move the rows
+PRINT_PAPER_IN = os.environ.get("PRINT_PAPER_IN", "9.5")   # paper width in inches (checks the form fits; browsers shrink anything wider)
 FORM = os.environ.get("RECEIPT_FORM", "receipt_form.txt")   # editable print layout (plain text)
 TABLES = {"customer": "Customers", "goods": "Goods", "discount": "Discounts"}
 
@@ -232,14 +233,124 @@ def receipt_print(i):
     if warn: flash(warn, "err")
     pt = request.args.get("pt", PRINT_PT)                     # /print?pt=9.5&bold=0 overrides without restarting
     wt = "bold" if request.args.get("bold", "1" if PRINT_BOLD == "bold" else "0") == "1" else "normal"
+    paper = request.args.get("paper", PRINT_PAPER_IN)
     try: float(pt)
     except ValueError: pt = PRINT_PT
-    return render_template_string(T_PRINT, i=i, W=W, body=body, font=PRINT_FONT, pt=pt, wt=wt, lh=PRINT_LINE_PT)
+    try: float(paper)
+    except ValueError: paper = PRINT_PAPER_IN
+    return render_template_string(T_PRINT, i=i, W=W, body=body, font=PRINT_FONT, pt=pt, wt=wt, lh=PRINT_LINE_PT, paper=paper)
+
+# ---------- dashboard / summary reports ----------
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+DASH_W = "(:lo IS NULL OR r.receipt_date>=:lo) AND (:hi IS NULL OR r.receipt_date<=:hi)"
+
+def fmt0(x): return f"{float(x):,.0f}"
+def fmtq(x): return f"{float(x):,.0f}" if float(x) == int(float(x)) else f"{float(x):,.2f}"
+def compact(n):
+    n = float(n)
+    if n >= 1e6: return f"{n/1e6:.1f}".rstrip("0").rstrip(".") + "M"
+    if n >= 1e3: return f"{n/1e3:.1f}".rstrip("0").rstrip(".") + "K"
+    return f"{n:g}"
+def dlabel(d): return f"{d.day} {MONTHS[d.month-1]} {d.year}"
+
+def dash_range():
+    """Date filter from the query string -> (lo, hi, preset, label); lo/hi are ISO strings or None (no limit)."""
+    from datetime import date, timedelta
+    t = date.today(); p = request.args.get("p", "all")
+    def pd(s):
+        try: return date.fromisoformat(s)
+        except ValueError: return None
+    f, to = request.args.get("from", ""), request.args.get("to", "")
+    if f or to:
+        lo, hi, p = pd(f), pd(to), "custom"
+        label = (dlabel(lo) if lo else "Start") + " – " + (dlabel(hi) if hi else "today")
+    elif p == "month": lo, hi, label = t.replace(day=1), t, "Month to date"
+    elif p == "30": lo, hi, label = t - timedelta(days=29), t, "Last 30 days"
+    elif p == "year": lo, hi, label = t.replace(month=1, day=1), t, "Year to date"
+    else: p, lo, hi, label = "all", None, None, "All time"
+    return (lo.isoformat() if lo else None, hi.isoformat() if hi else None, p, label)
+
+def dash_reports(lo, hi):
+    from datetime import date, timedelta
+    c = db(); a = {"lo": lo, "hi": hi}; W = DASH_W
+    kpi = c.execute(f"""SELECT COUNT(*) n, COALESCE(SUM(total),0) net, COALESCE(SUM(subtotal),0) gross,
+        COALESCE(SUM(discount_total),0) disc, COUNT(DISTINCT customer_id) cust, MIN(receipt_date) d0, MAX(receipt_date) d1
+        FROM receipt r WHERE {W}""", a).fetchone()
+    units = c.execute(f"SELECT COALESCE(SUM(d.quantity),0) FROM receipt_detail d JOIN receipt r ON r.id=d.receipt_id WHERE {W}", a).fetchone()[0]
+    days = {r["d"]: (r["n"], r["v"]) for r in c.execute(
+        f"SELECT receipt_date d, COUNT(*) n, SUM(total) v FROM receipt r WHERE {W} GROUP BY receipt_date", a)}
+    goods = c.execute(f"""SELECT g.code, MAX(d.goods_name) name, MAX(d.unit) unit, SUM(d.quantity) qty,
+        COUNT(DISTINCT d.receipt_id) n, SUM(d.net_amount) net FROM receipt_detail d
+        JOIN receipt r ON r.id=d.receipt_id JOIN goods g ON g.id=d.goods_id WHERE {W}
+        GROUP BY d.goods_id ORDER BY net DESC, g.code""", a).fetchall()
+    custs = c.execute(f"""SELECT cu.code, cu.name, cu.branch_a branch, COUNT(*) n, SUM(r.total) net FROM receipt r
+        JOIN customer cu ON cu.id=r.customer_id WHERE {W} GROUP BY r.customer_id ORDER BY net DESC, cu.code""", a).fetchall()
+    discs = c.execute(f"""SELECT d.discount_method method, COUNT(*) n, SUM(d.amount) gross, SUM(d.discount_amount) disc
+        FROM receipt_detail d JOIN receipt r ON r.id=d.receipt_id WHERE {W} AND d.discount_method<>''
+        GROUP BY d.discount_method ORDER BY disc DESC""", a).fetchall()
+    # sales per day (range up to ~2 months) or per month, with empty periods kept so the time axis is honest
+    series = []
+    if kpi["n"]:
+        d0, d1 = date.fromisoformat(kpi["d0"]), date.fromisoformat(kpi["d1"])
+        if (d1 - d0).days <= 62:
+            for k in range((d1 - d0).days + 1):
+                dt = d0 + timedelta(days=k); n, v = days.get(dt.isoformat(), (0, 0))
+                series.append(dict(key=dt.isoformat(), label=dlabel(dt), tick=f"{dt.day} {MONTHS[dt.month-1]}", n=n, v=v or 0))
+        else:
+            y, mo = d0.year, d0.month
+            while (y, mo) <= (d1.year, d1.month):
+                pre = f"{y}-{mo:02d}"; hit = [x for k2, x in days.items() if k2.startswith(pre)]
+                series.append(dict(key=pre, label=f"{MONTHS[mo-1]} {y}", tick=f"{MONTHS[mo-1]} {str(y)[2:]}",
+                                   n=sum(x[0] for x in hit), v=sum(x[1] for x in hit)))
+                y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    return dict(kpi=kpi, units=units, series=series, goods=goods, custs=custs, discs=discs)
+
+def nice_axis(vmax):
+    import math
+    raw = max(vmax, 1) / 4; mag = 10 ** math.floor(math.log10(raw))
+    step = next(k * mag for k in (1, 2, 2.5, 5, 10) if raw <= k * mag)
+    return step * 4, [step * i for i in range(5)]
+
+def hbars(rows, name, sub, value, n=8):
+    top = list(rows)[:n]; mx = max([float(value(r)) for r in top] + [1])
+    return [dict(name=name(r), sub=sub(r), v=fmt0(value(r)), pct=round(float(value(r)) / mx * 82, 1)) for r in top]
+
+@app.route("/dashboard")
+def dashboard():
+    lo, hi, p, label = dash_range(); R = dash_reports(lo, hi); k = R["kpi"]; qs = request.query_string.decode()
+    ctx = dict(p=p, label=label, lo=lo or "", hi=hi or "", qs=qs, n=k["n"])
+    if k["n"]:
+        top, ticks = nice_axis(max(s["v"] for s in R["series"]))
+        nb = len(R["series"]); step = -(-nb // 12); mx = max(range(nb), key=lambda i: R["series"][i]["v"])
+        bars = [dict(s, pct=round(s["v"] / top * 100, 1), val=m(s["v"]), sub=f"{s['n']} receipt{'s' if s['n'] != 1 else ''}",
+                     show=(i % step == 0), mx=(i == mx and s["v"] > 0), short=fmt0(s["v"]),
+                     side="l" if i < nb * .12 else "r" if i > nb * .88 else "") for i, s in enumerate(R["series"])]
+        ctx.update(bars=bars, ticks=[dict(pct=t / top * 100, label=compact(t)) for t in ticks],
+                   per="day" if "-" in R["series"][0]["key"][5:] else "month",
+                   hero=m(k["net"]), avg=m(k["net"] / k["n"]), disc=m(k["disc"]), gross=m(k["gross"]),
+                   dpct=f"{k['disc'] / k['gross'] * 100:.1f}" if k["gross"] else "0", units=fmtq(R["units"]), cust=k["cust"],
+                   goods=hbars(R["goods"], lambda r: f"{r['code']} · {r['name']}", lambda r: f"{fmtq(r['qty'])} {r['unit']} in {r['n']} receipts", lambda r: r["net"]),
+                   custs=hbars(R["custs"], lambda r: f"{r['code']} · {r['branch'] or r['name']}", lambda r: f"{r['name']} · {r['n']} receipts", lambda r: r["net"]),
+                   goods_t=R["goods"][:50], custs_t=R["custs"][:50], discs=R["discs"], ngoods=len(R["goods"]), ncust=len(R["custs"]))
+    return render_template_string(T_DASH, m=m, fmtq=fmtq, **ctx)
+
+@app.route("/dashboard.csv")
+def dashboard_csv():
+    import csv, io
+    lo, hi, _, _ = dash_range(); R = dash_reports(lo, hi); rep = request.args.get("report", "goods")
+    sets = {"sales": (["period", "receipts", "net_sales"], [(s["key"], s["n"], s["v"]) for s in R["series"]]),
+            "goods": (["code", "name", "unit", "quantity", "receipts", "net_sales"], [tuple(r) for r in R["goods"]]),
+            "customers": (["code", "name", "branch", "receipts", "net_sales"], [tuple(r) for r in R["custs"]]),
+            "discounts": (["discount", "lines", "gross_amount", "discount_amount"], [tuple(r) for r in R["discs"]])}
+    if rep not in sets: return "unknown report", 404
+    head, rows = sets[rep]; out = io.StringIO(); w = csv.writer(out); w.writerow(head); w.writerows(rows)
+    return Response("﻿" + out.getvalue(), mimetype="text/csv; charset=utf-8",      # BOM so Excel reads Thai
+                    headers={"Content-Disposition": f"attachment; filename={rep}_report.csv"})
 
 # ---------- templates ----------
 app.jinja_loader = DictLoader({"base": """<!doctype html><html lang="th"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }}</title><style>
-:root{--ink:#1d2a24;--mut:#66736c;--line:#d5dcd7;--bg:#f6f8f6;--g:#1f5c4a;--r:#a4372b}
+:root{color-scheme:light dark;--ink:#1d2a24;--mut:#66736c;--line:#d5dcd7;--bg:#f6f8f6;--g:#1f5c4a;--r:#a4372b}
 @media(prefers-color-scheme:dark){:root{--ink:#e6ece8;--mut:#9aa8a0;--line:#33413a;--bg:#161c19;--g:#6fc2a5;--r:#ef8f84}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Sarabun,Tahoma,"Noto Sans Thai",sans-serif}
 header{background:var(--g);color:#fff;padding:.7rem 1.2rem;display:flex;flex-wrap:wrap;gap:.4rem 1.6rem;align-items:baseline}
@@ -255,6 +366,7 @@ button,.btn{background:var(--g);color:#fff;border-color:var(--g);cursor:pointer;
 .msg{padding:.5rem .8rem;border-left:4px solid var(--g);background:Canvas;margin-bottom:1rem}.msg.err{border-color:var(--r);color:var(--r)}
 td input{width:100%;min-width:60px}form.i{display:inline}
 </style><header><b>{{ title }}</b><nav style="display:flex;gap:1.2rem;flex-wrap:wrap">
+<a href="/dashboard" class="{{ 'on' if nav=='d' }}">Dashboard</a>
 <a href="/receipts" class="{{ 'on' if nav=='r' }}">Receipts</a>
 {% for k,v in tables.items() %}<a href="/t/{{k}}" class="{{ 'on' if nav==k }}">{{v}}</a>{% endfor %}</nav></header><main>
 {% for c,mm in get_flashed_messages(with_categories=true) %}<div class="msg {{c}}">{{mm}}</div>{% endfor %}
@@ -335,9 +447,120 @@ font:{{wt}} {{pt}}pt/{{lh}}pt {{font}},"Leelawadee UI","Noto Sans Thai",sans-ser
 @media print{header,.noprint,.msg{display:none}main{padding:0;max-width:none}body{background:#fff}#sheet{border:0;padding:0;margin:0}@page{margin:6mm}}</style>
 <div class="noprint"><h1>Print receipt</h1><p style="color:var(--mut)">Click on the form to fix any text before printing. Layout comes from <b>receipt_form.txt</b>. In the print dialog choose your LQ-590 printer.</p>
 <div class="bar"><button onclick="window.print()">Print</button><a class="btn b2" href="/receipt/{{i}}">Edit receipt</a>
-<form class="i" method="get" style="display:inline-flex;gap:.4rem;align-items:center">Font pt <input name="pt" value="{{pt}}" size="3"> <label><input type="checkbox" name="bold" value="1" {{'checked' if wt=='bold'}}> Bold</label><input type="hidden" name="bold" value="0"><button class="b2">Apply</button></form>
+<form class="i" method="get" style="display:inline-flex;gap:.4rem;align-items:center">Font pt <input name="pt" value="{{pt}}" size="3"> Paper width in <input name="paper" value="{{paper}}" size="3"> <label><input type="checkbox" name="bold" value="1" {{'checked' if wt=='bold'}}> Bold</label><input type="hidden" name="bold" value="0"><button class="b2">Apply</button></form>
 <a class="btn b2" href="/form/blank">Blank form (.txt)</a><a class="btn b2" href="/receipts">Back</a></div></div>
-<div id="sheet" contenteditable="true" spellcheck="false">{{ body }}</div>{% endblock %}"""
+<div id="fit" class="msg noprint" hidden></div>
+<div id="sheet" contenteditable="true" spellcheck="false">{{ body }}</div>
+<script>
+/* Browsers shrink a page that is wider than the paper, so a bigger Font pt can print the same size or smaller.
+   This measures the form in this browser and says what will really print. */
+(function(){const s=document.getElementById('sheet'),cs=getComputedStyle(s),el=document.getElementById('fit');
+const inch=(s.clientWidth-parseFloat(cs.paddingLeft)-parseFloat(cs.paddingRight))/96,
+avail={{paper}}-2*6/25.4, pt={{pt}}, fit=Math.floor(pt*avail/inch*10)/10;
+el.hidden=false;
+if(inch>avail+0.01){el.classList.add('err');
+ el.textContent='Form is '+inch.toFixed(2)+' in wide, but '+{{paper}}+' in paper prints only '+avail.toFixed(2)+' in. The browser will shrink the print to about '+fit+' pt, so a larger Font pt will not print larger. Use Font pt '+fit+' or less, or make the form narrower in receipt_form.txt.';}
+else{el.textContent='Fits: form is '+inch.toFixed(2)+' in wide, paper prints '+avail.toFixed(2)+' in. Prints at the full '+pt+' pt. Largest size that still fits: '+fit+' pt.';}})();
+</script>{% endblock %}"""
+
+T_DASH = "{% extends 'base' %}{% set nav='d' %}{% block body %}" + """
+<style>
+.viz{--v-s1:#2a78d6;--v-surf:#fcfcfb;--v-ink:#0b0b0b;--v-ink2:#52514e;--v-mute:#898781;--v-grid:#e1e0d9;--v-axis:#c3c2b7;--v-ring:rgba(11,11,11,.10);
+ font-family:system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Thai",sans-serif;position:relative}
+@media(prefers-color-scheme:dark){.viz{--v-s1:#3987e5;--v-surf:#1a1a19;--v-ink:#f0efec;--v-ink2:#c3c2b7;--v-mute:#898781;--v-grid:#2c2c2a;--v-axis:#383835;--v-ring:rgba(255,255,255,.10)}}
+.filters{display:flex;flex-wrap:wrap;gap:.6rem 1rem;align-items:center;margin-bottom:1.2rem}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg a{padding:.35rem .9rem;text-decoration:none;color:var(--ink);border-right:1px solid var(--line)}
+.seg a:last-child{border-right:0}.seg a:hover{background:rgba(128,128,128,.12)}
+.seg a[aria-current]{font-weight:700;background:rgba(128,128,128,.18)}.seg a[aria-current]::before{content:"✓ "}
+.filters form{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}.filters input[type=date]{padding:.3rem .5rem}
+.card{background:var(--v-surf);color:var(--v-ink);border:1px solid var(--v-ring);border-radius:6px;padding:1rem 1.3rem;margin-bottom:1rem}
+.card h2{font-size:1rem;margin:0 0 .15rem}.card .sub{color:var(--v-ink2);font-size:.85rem;margin:0 0 .8rem}
+.card .hd{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap}
+.card .hd a{color:var(--v-ink2);font-size:.85rem}
+.top{display:grid;grid-template-columns:minmax(280px,1.15fr) 2fr;gap:1rem;margin-bottom:1rem}.top .card{margin:0}
+.hero .lb{color:var(--v-ink2)}.hero .v{font-size:3.4rem;font-weight:700;line-height:1.15}.hero .u{font-size:1.1rem;font-weight:500;color:var(--v-ink2);margin-left:.4rem}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}.tiles .card{margin:0;padding:.8rem 1rem}
+.tile .lb{color:var(--v-ink2);font-size:.85rem}.tile .v{font-size:1.7rem;font-weight:650;line-height:1.25}.tile .nt{color:var(--v-mute);font-size:.8rem}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.two .card{margin:0}
+.plot{position:relative;height:200px;margin:.4rem 0 0 46px;border-bottom:1px solid var(--v-axis)}
+.gl{position:absolute;left:0;right:0;border-top:1px solid var(--v-grid)}.gl span{position:absolute;right:calc(100% + 8px);top:-.65em;font-size:.75rem;color:var(--v-mute)}
+.cols{position:absolute;inset:0;display:flex;gap:2px;align-items:flex-end}
+.slot{flex:1;min-width:0;height:100%;position:relative;display:flex;align-items:flex-end;justify-content:center;outline:0}
+.slot i{display:block;width:100%;max-width:24px;background:var(--v-s1);border-radius:4px 4px 0 0}
+.slot:hover i,.slot:focus-visible i{filter:brightness(1.15)}.slot:focus-visible{outline:2px solid var(--v-ink2);outline-offset:-2px}
+.slot em{position:absolute;font-style:normal;font-size:.8rem;color:var(--v-ink2);white-space:nowrap;left:50%;transform:translateX(-50%)}
+.slot em.l{left:0;transform:none}.slot em.r{left:auto;right:0;transform:none}
+.xl{display:flex;gap:2px;margin:.35rem 0 0 46px}.xl span{flex:1;min-width:0;text-align:center;font-size:.75rem;color:var(--v-mute);white-space:nowrap}
+.hb{list-style:none;margin:0;padding:0}.hb li{display:grid;grid-template-columns:minmax(0,40%) 1fr;gap:10px;align-items:center;min-height:32px;outline:0}
+.hb .nm{font-size:.88rem;color:var(--v-ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
+.hb .tr{position:relative;height:14px}.hb b{position:absolute;left:0;top:0;height:14px;background:var(--v-s1);border-radius:0 4px 4px 0}
+.hb em{position:absolute;top:-2px;font-style:normal;font-size:.8rem;color:var(--v-ink2);white-space:nowrap}
+.hb li:hover b,.hb li:focus-visible b{filter:brightness(1.15)}.hb li:focus-visible{outline:2px solid var(--v-ink2);outline-offset:1px}
+.card details{margin-top:.8rem}.card summary{cursor:pointer;color:var(--v-ink2);font-size:.85rem}
+.card table{background:transparent;margin-top:.4rem;font-size:.88rem}.card th{color:var(--v-ink2)}.card td,.card th{border-bottom:1px solid var(--v-grid)}
+.empty{padding:2rem;text-align:center;color:var(--v-ink2)}
+#vtip{position:fixed;z-index:20;pointer-events:none;background:var(--v-surf);color:var(--v-ink);border:1px solid var(--v-axis);border-radius:6px;padding:.45rem .7rem;max-width:280px}
+#vtip strong{display:block;font-size:1rem}#vtip span{display:block;font-size:.85rem;color:var(--v-ink2)}#vtip small{display:block;font-size:.78rem;color:var(--v-mute)}
+@media(max-width:800px){.top,.two{grid-template-columns:1fr}.hero .v{font-size:2.8rem}}
+@media print{header,.noprint{display:none!important}main{padding:0;max-width:none}body{background:#fff}.card{break-inside:avoid}.two,.top{display:block}.two .card,.top .card{margin-bottom:1rem}}
+</style>
+<div class="viz">
+<div class="filters noprint"><div class="seg">
+{% for k,t in [('all','All time'),('year','Year to date'),('month','Month to date'),('30','Last 30 days')] %}<a href="/dashboard?p={{k}}" {{'aria-current=page' if p==k}}>{{t}}</a>{% endfor %}</div>
+<form method="get" action="/dashboard"><input type="date" name="from" value="{{lo}}" aria-label="From date"> to <input type="date" name="to" value="{{hi}}" aria-label="To date"><button class="b2">Apply</button></form>
+<button class="b2" style="margin-left:auto" onclick="window.print()">Print report</button></div>
+<h1>Dashboard <span style="font-weight:400;color:var(--mut);font-size:1rem">· {{label}}</span></h1>
+{% if not n %}<div class="card empty">No receipts in this range. Pick a wider range, or <a href="/receipt/new">create a receipt</a>.</div>
+{% else %}
+<div class="top"><div class="card hero"><div class="lb">Net sales</div><div><span class="v">{{hero}}</span><span class="u">THB</span></div>
+<div class="nt" style="color:var(--v-mute);font-size:.85rem">{{n}} receipt{{'s' if n!=1}} · {{label}}</div></div>
+<div class="tiles">
+<div class="card tile"><div class="lb">Average receipt</div><div class="v">{{avg}}</div></div>
+<div class="card tile"><div class="lb">Discounts given</div><div class="v">{{disc}}</div><div class="nt">{{dpct}}% of {{gross}} before discount</div></div>
+<div class="card tile"><div class="lb">Units sold</div><div class="v">{{units}}</div></div>
+<div class="card tile"><div class="lb">Customers served</div><div class="v">{{cust}}</div></div></div></div>
+
+<div class="card"><div class="hd"><h2>Net sales by {{per}}</h2><a class="noprint" href="/dashboard.csv?report=sales&amp;{{qs}}">Download CSV</a></div>
+<p class="sub">Receipt totals after discount, THB. Hover or tab to a column for the exact value.</p>
+<div class="plot">{% for t in ticks %}<div class="gl" style="bottom:{{t.pct}}%"><span>{{t.label}}</span></div>{% endfor %}
+<div class="cols">{% for b in bars %}<div class="slot" tabindex="0" data-label="{{b.label}}" data-value="{{b.val}} THB" data-sub="{{b.sub}}"><i style="height:{{b.pct}}%"></i>{% if b.mx %}<em class="{{b.side}}" style="bottom:calc({{b.pct}}% + 4px)">{{b.short}}</em>{% endif %}</div>{% endfor %}</div></div>
+<div class="xl">{% for b in bars %}<span>{{b.tick if b.show}}</span>{% endfor %}</div>
+<details><summary>Table view</summary><table><tr><th>Period</th><th class="n">Receipts</th><th class="n">Net sales</th></tr>
+{% for b in bars %}<tr><td>{{b.label}}</td><td class="n">{{b.sub.split()[0]}}</td><td class="n">{{b.val}}</td></tr>{% endfor %}</table></details></div>
+
+<div class="two">
+<div class="card"><div class="hd"><h2>Top goods</h2><a class="noprint" href="/dashboard.csv?report=goods&amp;{{qs}}">Download CSV</a></div>
+<p class="sub">Net sales, THB. Top {{goods|length}} of {{ngoods}}.</p>
+<ol class="hb">{% for r in goods %}<li tabindex="0" data-label="{{r.name}}" data-value="{{r.v}} THB" data-sub="{{r.sub}}"><span class="nm" title="{{r.name}}">{{r.name}}</span><span class="tr"><b style="width:{{r.pct}}%"></b><em style="left:calc({{r.pct}}% + 6px)">{{r.v}}</em></span></li>{% endfor %}</ol>
+<details><summary>Table view</summary><table><tr><th>Goods</th><th class="n">Qty</th><th class="n">Receipts</th><th class="n">Net sales</th></tr>
+{% for r in goods_t %}<tr><td>{{r.code}} · {{r.name}}</td><td class="n">{{fmtq(r.qty)}} {{r.unit}}</td><td class="n">{{r.n}}</td><td class="n">{{m(r.net)}}</td></tr>{% endfor %}</table>{% if ngoods>50 %}<p class="sub">First 50 shown; the CSV has all {{ngoods}}.</p>{% endif %}</details></div>
+<div class="card"><div class="hd"><h2>Top customers</h2><a class="noprint" href="/dashboard.csv?report=customers&amp;{{qs}}">Download CSV</a></div>
+<p class="sub">Net sales, THB. Top {{custs|length}} of {{ncust}}.</p>
+<ol class="hb">{% for r in custs %}<li tabindex="0" data-label="{{r.name}}" data-value="{{r.v}} THB" data-sub="{{r.sub}}"><span class="nm" title="{{r.name}}">{{r.name}}</span><span class="tr"><b style="width:{{r.pct}}%"></b><em style="left:calc({{r.pct}}% + 6px)">{{r.v}}</em></span></li>{% endfor %}</ol>
+<details><summary>Table view</summary><table><tr><th>Customer</th><th class="n">Receipts</th><th class="n">Net sales</th></tr>
+{% for r in custs_t %}<tr><td>{{r.code}} · {{r.name}} {{r.branch}}</td><td class="n">{{r.n}}</td><td class="n">{{m(r.net)}}</td></tr>{% endfor %}</table>{% if ncust>50 %}<p class="sub">First 50 shown; the CSV has all {{ncust}}.</p>{% endif %}</details></div></div>
+
+<div class="card" style="margin-top:1rem"><div class="hd"><h2>Discounts given</h2><a class="noprint" href="/dashboard.csv?report=discounts&amp;{{qs}}">Download CSV</a></div>
+{% if discs %}<p class="sub">By discount method, on lines that used one.</p><table><tr><th>Discount</th><th class="n">Lines</th><th class="n">Before discount</th><th class="n">Discount</th></tr>
+{% for r in discs %}<tr><td>{{r.method}}</td><td class="n">{{r.n}}</td><td class="n">{{m(r.gross)}}</td><td class="n">{{m(r.disc)}}</td></tr>{% endfor %}</table>
+{% else %}<p class="sub">No discounts were used in this range.</p>{% endif %}</div>
+{% endif %}
+</div>
+<script>
+(function(){const root=document.querySelector('.viz'),tip=document.createElement('div');tip.id='vtip';tip.hidden=true;root.append(tip);
+function show(el,x,y){tip.replaceChildren();const v=document.createElement('strong');v.textContent=el.dataset.value;
+ const l=document.createElement('span');l.textContent=el.dataset.label;tip.append(v,l);
+ if(el.dataset.sub){const s=document.createElement('small');s.textContent=el.dataset.sub;tip.append(s)}
+ tip.hidden=false;const w=tip.offsetWidth,h=tip.offsetHeight;
+ tip.style.left=Math.max(4,Math.min(x+14,innerWidth-w-4))+'px';tip.style.top=Math.max(4,y-h-10)+'px'}
+function hide(){tip.hidden=true}
+root.querySelectorAll('[data-value]').forEach(el=>{
+ el.addEventListener('pointermove',e=>show(el,e.clientX,e.clientY));el.addEventListener('pointerleave',hide);
+ el.addEventListener('focus',()=>{const r=el.getBoundingClientRect();show(el,r.left+r.width/2,r.top)});el.addEventListener('blur',hide)});
+let opened=[];addEventListener('beforeprint',()=>{opened=[...document.querySelectorAll('details:not([open])')];opened.forEach(d=>d.open=true)});
+addEventListener('afterprint',()=>{opened.forEach(d=>d.open=false);opened=[]});})();
+</script>{% endblock %}"""
 
 with sqlite3.connect(DB) as _c:
     _c.executescript(SCHEMA)
